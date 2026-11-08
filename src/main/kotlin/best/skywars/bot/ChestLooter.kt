@@ -48,10 +48,11 @@ object ChestLooter {
                 val horizontalDistSq = dx * dx + dz * dz
                 if (horizontalDistSq > 22.0 * 22.0) continue // Too far from spawn island
 
-                // Height check relative to where the player landed on the island:
-                // Only chests on/near the surface platform (not deep cave chests).
+                // Height check relative to where the player landed on the island.
+                // Wide downward range so a landing on top of a tree can still see the
+                // ground chests below (the A* pathfinder walks us down to them).
                 val dy = pos.y - landingPos.y
-                if (dy < -3 || dy > 5) continue
+                if (dy < -8 || dy > 5) continue
 
                 // Ensure the chest is NOT buried underground (block directly above chest MUST be AIR)
                 val blockAbove = world.getBlockState(pos.up()).block

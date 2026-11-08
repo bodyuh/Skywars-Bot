@@ -5,6 +5,7 @@ import net.minecraft.client.settings.KeyBinding
 import net.minecraft.entity.Entity
 import net.minecraft.entity.player.EntityPlayer
 import net.minecraft.init.Blocks
+import net.minecraft.item.ItemAppleGold
 import net.minecraft.item.ItemFishingRod
 import net.minecraft.item.ItemSword
 import net.minecraft.util.BlockPos
@@ -16,6 +17,15 @@ import kotlin.math.sqrt
 // the void) are IGNORED: the bot never aims at or chases them.
 const val ENGAGE_RANGE: Double = 10.0
 
+/**
+ * Melee engine rewritten after duck-dueller-v2 technique and analysis of the
+ * player's (imnumbagain) won replays:
+ *  - NO fishing rod: the human used the rod 0% of the time across 3 wins.
+ *  - Heavy A/D strafing (~20-35% each) with mostly-forward pressure.
+ *  - Smooth, capped, distance-scaled aim (not instant GCD snapping).
+ *  - Click autoclicker 9-13 CPS, firing only on a real raycast hit.
+ *  - Combo-based crit jumps.
+ */
 object CombatEngine {
 
     private val mc = Minecraft.getMinecraft()
@@ -26,16 +36,28 @@ object CombatEngine {
     var currentTarget: EntityPlayer? = null
     var isAvoidingStrength = false
 
-    private var lastAttackTime = 0L
-    private var lastRodTime = 0L
-    private var rodStage = 0 // 0 = idle, 1 = casted, 2 = return to sword
-    private var prevHotbarSlot = 0
+    // ---- combat state ----
+    private var combo = 0
+    private var lastHitMs = 0L
+    private var lastClickMs = 0L
+    private var nextCps = 95L
+
+    private var strafeDir = 1              // +1 = right (D), -1 = left (A)
+    private var nextStrafeSwitchMs = 0L
+
+    private var forwardBlockedUntilMs = 0L // W-tap window
+    private var jumpReleaseAtMs = 0L
+
+    private var eatingUntilMs = 0L
+    private var lastEatMs = 0L
+    private var savedSlotBeforeEat = -1
 
     fun reset() {
         strengthMap.clear()
         currentTarget = null
         isAvoidingStrength = false
-        rodStage = 0
+        combo = 0
+        eatingUntilMs = 0L
         releaseCombatKeys()
     }
 
@@ -44,14 +66,15 @@ object CombatEngine {
         val gs = mc.gameSettings ?: return
         KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindLeft.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, false)
     }
 
-    /**
-     * Call when a chat kill event is detected
-     */
+    // ---- Strength (Bulldozer) tracking ----
     fun onPlayerKill(killerName: String) {
         val cleanName = killerName.trim().split(" ").last() // strips rank like [VIP+]
         strengthMap[cleanName] = System.currentTimeMillis() + 5000L
@@ -84,7 +107,6 @@ object CombatEngine {
             if (other == player || other !is EntityPlayer) continue
             if (other.isDead || other.health <= 0f) continue
             if (other.isInvisibleToPlayer(player)) continue
-            // Spectators / lobby ghosts fly; a real combatant is near our height.
             if (Math.abs(other.posY - player.posY) > 6.0) continue
 
             val dist = player.getDistanceToEntity(other).toDouble()
@@ -97,14 +119,232 @@ object CombatEngine {
     }
 
     /**
-     * True if walking straight toward [target] would step off the island into the
-     * void (no solid block ~1 block ahead at feet level or just below it).
+     * Main melee tick. Handles aim, autoclick, strafe, w-tap, crit jumps,
+     * gapple heal and anti-strength backpedal. No fishing rod.
      */
-    private fun isVoidAhead(target: Entity): Boolean {
-        val player = mc.thePlayer ?: return false
-        val world = mc.theWorld ?: return false
+    fun tickCombat() {
+        val player = mc.thePlayer ?: return
+        val gs = mc.gameSettings ?: return
+        val now = System.currentTimeMillis()
+
+        currentTarget = findNearestEnemy()
+        val target = currentTarget
+        if (target == null) {
+            isAvoidingStrength = false
+            combo = 0
+            releaseCombatKeys()
+            return
+        }
+
+        val dist = player.getDistanceToEntity(target)
+
+        // Decay combo if we've not landed a hit recently or drifted far.
+        if (now - lastHitMs > 900 || dist > 5f) combo = 0
+
+        // Always track the target smoothly.
+        aimAt(target)
+
+        // Equip best sword (unless mid-eat).
+        if (now >= eatingUntilMs) {
+            val swordSlot = findBestSwordSlot()
+            if (swordSlot != -1 && player.inventory.currentItem != swordSlot) {
+                player.inventory.currentItem = swordSlot
+            }
+        }
+
+        // --- Gapple heal: low HP, have a gapple, not already eating, cooldown ok ---
+        if (now >= eatingUntilMs && player.health <= 6f && now - lastEatMs > 6000) {
+            val gapSlot = findHotbarGapple()
+            if (gapSlot != -1) {
+                savedSlotBeforeEat = player.inventory.currentItem
+                player.inventory.currentItem = gapSlot
+                KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, true)
+                eatingUntilMs = now + 1800
+                lastEatMs = now
+            }
+        }
+        if (now < eatingUntilMs) {
+            // While eating: stand still-ish, keep use held, no attacking.
+            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, true)
+            KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
+            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+            return
+        } else if (savedSlotBeforeEat != -1) {
+            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, false)
+            val swordSlot = findBestSwordSlot()
+            player.inventory.currentItem = if (swordSlot != -1) swordSlot else savedSlotBeforeEat
+            savedSlotBeforeEat = -1
+        }
+
+        // --- Anti-Strength: enemy under Bulldozer strength -> keep distance, no pushing ---
+        if (hasStrength(target)) {
+            isAvoidingStrength = true
+            KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, true)
+            if (dist < 7f) {
+                // back off, but not off the island
+                if (!isVoidTowards(player.posX - target.posX, player.posZ - target.posZ)) {
+                    KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+                    KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, true)
+                } else {
+                    KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+                }
+                doStrafe(player, target, now)
+            } else {
+                KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+                clearStrafe(gs)
+            }
+            // still trade hits if they walk into reach
+            tryAttack(player, gs, target, dist, now)
+            return
+        }
+        isAvoidingStrength = false
+
+        // --- Normal melee ---
+        KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, true)
+
+        // Forward / W-tap spacing (mirrors duck-dueller Combo).
+        val wantForward = !(dist < 1.5f || (dist < 2.4f && combo >= 1))
+        if (now < forwardBlockedUntilMs) {
+            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+        } else if (wantForward && !isVoidTowards(target.posX - player.posX, target.posZ - player.posZ)) {
+            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, true)
+            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+        } else {
+            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+        }
+
+        // Strafe when in a fighting pocket.
+        if (dist < 7f) doStrafe(player, target, now) else clearStrafe(gs)
+
+        // Crit jumps on a built combo.
+        if (combo >= 3 && dist >= 3.2f && player.onGround && now > jumpReleaseAtMs + 200) {
+            KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, true)
+            jumpReleaseAtMs = now + 120
+        }
+        if (now >= jumpReleaseAtMs) {
+            KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
+        }
+
+        tryAttack(player, gs, target, dist, now)
+    }
+
+    private fun tryAttack(player: EntityPlayer, gs: net.minecraft.client.settings.GameSettings,
+                          target: EntityPlayer, dist: Float, now: Long) {
+        val over = mc.objectMouseOver
+        val aimedAtTarget = over != null && over.entityHit === target
+        if ((aimedAtTarget || dist <= 3.0f) && now - lastClickMs >= nextCps) {
+            // native swing + direct attack so Vape handles reach/raycast legitimately
+            if (!player.isUsingItem) {
+                player.swingItem()
+                if (aimedAtTarget) {
+                    mc.playerController.attackEntity(player, target)
+                }
+                KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, true)
+                TimeHelper.setTimeout({
+                    KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, false)
+                }, (25 + Math.random() * 20).toLong())
+
+                lastClickMs = now
+                nextCps = (1000L / (9 + (Math.random() * 5).toInt()))  // ~9-13 CPS
+                if (aimedAtTarget) {
+                    combo++
+                    lastHitMs = now
+                    // W-tap: drop forward momentum briefly for extra knockback
+                    forwardBlockedUntilMs = now + (60 + Math.random() * 50).toLong()
+                }
+            }
+        }
+    }
+
+    private fun doStrafe(player: EntityPlayer, target: EntityPlayer, now: Long) {
+        val gs = mc.gameSettings ?: return
+        if (now > nextStrafeSwitchMs) {
+            // When closing a combo, bias strafe toward the enemy's back.
+            if (combo > 2) {
+                val dyaw = wrap180(angleToYaw(target.posX - player.posX, target.posZ - player.posZ) - player.rotationYaw)
+                strafeDir = if (dyaw < 0) -1 else 1
+            } else {
+                strafeDir = -strafeDir
+            }
+            nextStrafeSwitchMs = now + (280 + Math.random() * 420).toLong()
+        }
+        // perpendicular-to-target direction for the current strafe side
+        val tx = target.posX - player.posX
+        val tz = target.posZ - player.posZ
+        // right vector relative to facing the target: (dz, -dx) ; left is negation
+        val px = if (strafeDir > 0) tz else -tz
+        val pz = if (strafeDir > 0) -tx else tx
+        if (isVoidTowards(px, pz)) {
+            // edge on that side: flip once; if both bad, don't strafe
+            strafeDir = -strafeDir
+            val px2 = if (strafeDir > 0) tz else -tz
+            val pz2 = if (strafeDir > 0) -tx else tx
+            if (isVoidTowards(px2, pz2)) { clearStrafe(gs); return }
+        }
+        if (strafeDir > 0) {
+            KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, true)
+            KeyBinding.setKeyBindState(gs.keyBindLeft.keyCode, false)
+        } else {
+            KeyBinding.setKeyBindState(gs.keyBindLeft.keyCode, true)
+            KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, false)
+        }
+    }
+
+    private fun clearStrafe(gs: net.minecraft.client.settings.GameSettings) {
+        KeyBinding.setKeyBindState(gs.keyBindLeft.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, false)
+    }
+
+    // ---- aim ----
+    fun lookAtEntity(target: Entity) = aimAt(target)
+
+    private fun aimAt(target: Entity) {
+        val player = mc.thePlayer ?: return
         val dx = target.posX - player.posX
         val dz = target.posZ - player.posZ
+        val dy = (target.posY + target.getEyeHeight() * 0.9) - (player.posY + player.getEyeHeight())
+        val distXZ = sqrt(dx * dx + dz * dz)
+
+        val targetYaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
+        val targetPitch = (-Math.toDegrees(atan2(dy, distXZ))).toFloat().coerceIn(-90f, 90f)
+
+        val dist3 = player.getDistanceToEntity(target)
+        val factor = when {
+            dist3 <= 10f -> 1.0f
+            dist3 <= 20f -> 0.6f
+            else -> 0.4f
+        }
+        val maxYaw = 9f * factor
+        val maxPitch = 5f * factor
+
+        var dyaw = wrap180(targetYaw - player.rotationYaw) + (Math.random() * 2 - 1).toFloat()
+        var dpitch = (targetPitch - player.rotationPitch) + (Math.random() * 1.2 - 0.6).toFloat()
+
+        if (dyaw > maxYaw) dyaw = maxYaw
+        if (dyaw < -maxYaw) dyaw = -maxYaw
+        if (dpitch > maxPitch) dpitch = maxPitch
+        if (dpitch < -maxPitch) dpitch = -maxPitch
+
+        player.rotationYaw += dyaw
+        player.rotationPitch = (player.rotationPitch + dpitch).coerceIn(-90f, 90f)
+    }
+
+    private fun angleToYaw(dx: Double, dz: Double): Float =
+        (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
+
+    private fun wrap180(ang: Float): Float {
+        var a = ang % 360f
+        if (a < -180f) a += 360f
+        if (a > 180f) a -= 360f
+        return a
+    }
+
+    /** True if stepping ~1 block along (dx,dz) would leave solid ground (void). */
+    private fun isVoidTowards(dx: Double, dz: Double): Boolean {
+        val player = mc.thePlayer ?: return false
+        val world = mc.theWorld ?: return false
         val len = sqrt(dx * dx + dz * dz)
         if (len < 0.01) return false
         val nx = dx / len
@@ -112,157 +352,30 @@ object CombatEngine {
         val checkX = player.posX + nx * 1.1
         val checkZ = player.posZ + nz * 1.1
         val feet = BlockPos(checkX, player.posY - 0.2, checkZ)
-        // Solid ground must exist within 1 block below the step-ahead position.
-        for (dy in 0..1) {
-            val p = BlockPos(feet.x, feet.y - dy, feet.z)
+        for (d in 0..1) {
+            val p = BlockPos(feet.x, feet.y - d, feet.z)
             val b = world.getBlockState(p).block
             if (b != Blocks.air && b.isCollidable) return false
         }
         return true
     }
 
-    fun tickCombat() {
-        val player = mc.thePlayer ?: return
-        val world = mc.theWorld ?: return
-
-        currentTarget = findNearestEnemy()
-        val target = currentTarget
-
-        if (target == null) {
-            // No enemy within engage range: release all combat movement so we
-            // don't keep walking/sprinting toward nothing (and into the void).
-            isAvoidingStrength = false
-            releaseCombatKeys()
-            return
+    // ---- inventory helpers ----
+    private fun findHotbarGapple(): Int {
+        val player = mc.thePlayer ?: return -1
+        for (i in 0..8) {
+            val s = player.inventory.getStackInSlot(i)
+            if (s != null && s.item is ItemAppleGold) return i
         }
-
-        val dist = player.getDistanceToEntity(target)
-
-        // 1. Anti-Strength Logic: Do NOT engage if enemy has Strength (Bulldozer 5s)
-        if (hasStrength(target)) {
-            isAvoidingStrength = true
-            val remSec = getStrengthRemainingSec(target)
-
-            // Look at enemy to track them and rod them away if they rush
-            lookAtEntity(target)
-
-            if (dist < 12.0f) {
-                // Backpedal and keep distance
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, true)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
-
-                // If enemy gets too close (< 7m), rod them to knock them back!
-                if (dist < 7.0f && System.currentTimeMillis() - lastRodTime > 700) {
-                    executeRodKnockback()
-                }
-            } else {
-                // Safe distance, hold position
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-            }
-            return
-        }
-
-        isAvoidingStrength = false
-
-        // 2. Normal Combat: Enemy has NO Strength
-
-        // Look smoothly at target hitbox using GCD-aligned angles
-        lookAtEntity(target)
-
-        // Fishing Rod knockback trick at 4.5m - 8.0m distance
-        val rodSlot = findHotbarRod()
-        val now = System.currentTimeMillis()
-
-        if (rodSlot != -1 && dist in 4.5f..8.0f && (now - lastRodTime > 1200)) {
-            executeRodKnockback()
-            return
-        }
-
-        // Equip best sword
-        val swordSlot = findBestSwordSlot()
-        if (swordSlot != -1 && player.inventory.currentItem != swordSlot && rodStage == 0) {
-            player.inventory.currentItem = swordSlot
-        }
-
-        // Approach & W-Tap combo movement
-        if (dist > 2.2f) {
-            if (isVoidAhead(target)) {
-                // Enemy is across an edge/gap: hold the island, never chase off.
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, false)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
-            } else {
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
-            }
-        } else if (dist < 1.7f) {
-            // Keep sweet spot combo distance ~1.9m - 2.1m
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, true)
-        } else {
-            // In optimal combo lock range
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
-        }
-
-        // Critical hit timing: jump when approaching inside 3.0m
-        if (dist <= 3.0f && player.onGround && Math.random() < 0.25) {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, true)
-        } else {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, false)
-        }
-
-        // 3. Attack trigger: NO custom reach packets!
-        // We simulate native LMB clicks with human-like jittered delay (95-135ms ~ 8-11 CPS).
-        // Vape v4 hooks getMouseOver / raytrace and handles the 3.15-3.2 Reach completely legitimately.
-        val isAimedAtTarget = mc.objectMouseOver?.entityHit == target
-        val jitteredDelay = (95 + Math.random() * 40).toLong()
-
-        if ((isAimedAtTarget || dist <= 3.2f) && (now - lastAttackTime >= jitteredDelay)) {
-            // Press native attack key so Minecraft/Vape processes raycast and reach
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode, true)
-            lastAttackTime = now
-
-            TimeHelper.setTimeout({
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindAttack.keyCode, false)
-            }, (30 + Math.random() * 20).toLong())
-
-            // W-Tap: momentary sprint reset on hit for knockback combo
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
-        }
+        return -1
     }
 
-    private fun executeRodKnockback() {
-        val player = mc.thePlayer ?: return
-        val rodSlot = findHotbarRod()
-        if (rodSlot == -1) return
-
-        prevHotbarSlot = player.inventory.currentItem
-        player.inventory.currentItem = rodSlot
-
-        // Cast rod (right click)
-        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, true)
-        lastRodTime = System.currentTimeMillis()
-
-        // Switch back to sword after 100ms
-        best.skywars.bot.TimeHelper.setTimeout({
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false)
-            val swordSlot = findBestSwordSlot()
-            player.inventory.currentItem = if (swordSlot != -1) swordSlot else prevHotbarSlot
-        }, 100)
-    }
-
+    @Suppress("unused")
     private fun findHotbarRod(): Int {
         val player = mc.thePlayer ?: return -1
         for (i in 0..8) {
-            val stack = player.inventory.getStackInSlot(i)
-            if (stack != null && stack.item is ItemFishingRod) {
-                return i
-            }
+            val s = player.inventory.getStackInSlot(i)
+            if (s != null && s.item is ItemFishingRod) return i
         }
         return -1
     }
@@ -271,7 +384,6 @@ object CombatEngine {
         val player = mc.thePlayer ?: return -1
         var bestSlot = -1
         var bestScore = 0f
-
         for (i in 0..8) {
             val stack = player.inventory.getStackInSlot(i)
             if (stack != null && stack.item is ItemSword) {
@@ -283,40 +395,5 @@ object CombatEngine {
             }
         }
         return bestSlot
-    }
-
-    fun lookAtEntity(target: Entity) {
-        val player = mc.thePlayer ?: return
-        val dx = target.posX - player.posX
-        // Aim at torso/head (height * 0.75)
-        val dy = (target.posY + target.height * 0.75) - (player.posY + player.getEyeHeight())
-        val dz = target.posZ - player.posZ
-        val dist = sqrt(dx * dx + dz * dz)
-
-        val targetYaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
-        val targetPitch = (-Math.toDegrees(atan2(dy, dist))).toFloat()
-
-        // Interpolate angle with GCD parity for mouse sensitivity
-        val smoothYaw = interpolateAngle(player.rotationYaw, targetYaw, 0.40f)
-        val smoothPitch = interpolateAngle(player.rotationPitch, targetPitch, 0.40f)
-
-        player.rotationYaw = applyGCD(smoothYaw, player.rotationYaw)
-        player.rotationPitch = applyGCD(smoothPitch, player.rotationPitch)
-    }
-
-    private fun applyGCD(targetAngle: Float, currentAngle: Float): Float {
-        val sens = mc.gameSettings.mouseSensitivity * 0.6f + 0.2f
-        val gcd = sens * sens * sens * 1.2f
-        if (gcd <= 0f) return targetAngle
-        val delta = targetAngle - currentAngle
-        val fixedDelta = Math.round(delta / gcd) * gcd
-        return currentAngle + fixedDelta
-    }
-
-    private fun interpolateAngle(from: Float, to: Float, factor: Float): Float {
-        var diff = (to - from) % 360f
-        if (diff < -180f) diff += 360f
-        if (diff > 180f) diff -= 360f
-        return from + diff * factor
     }
 }

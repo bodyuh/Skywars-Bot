@@ -23,7 +23,7 @@ enum class BotState {
     LOBBY,
     IN_CAGE,
     LOOTING_CHESTS,
-    BRIDGING,
+    PUSHING,
     COMBAT
 }
 
@@ -48,8 +48,9 @@ class SkywarsBot {
     }
 
     private var landingPos: BlockPos? = null
-    private var targetBridgePos: BlockPos? = null
+    private var midTarget: BlockPos? = null
     private var lootStartMs = 0L
+    private var pushStuckMs = 0L
 
     // How long to stay in the looting phase. Replays of won games show the human
     // loots for ~11-15s (opening many chests) BEFORE the first fight, so give the
@@ -116,9 +117,11 @@ class SkywarsBot {
             raw.contains("The game has started!", ignoreCase = true)) {
             state = BotState.LOOTING_CHESTS
             landingPos = null
+            midTarget = null
             lootStartMs = 0L
             ChestLooter.reset()
             CombatEngine.reset()
+            SkyPathfinder.reset()
             logChat("${EnumChatFormatting.AQUA}Клетки открылись! Приземляюсь и лутаю остров...")
         }
 
@@ -188,6 +191,7 @@ class SkywarsBot {
                 // standing on their own island don't interrupt the loot run.
                 if (mc.currentScreen == null && CombatEngine.findNearestEnemy(5.0) != null) {
                     ChestLooter.targetChestPos = null
+                    SkyPathfinder.stop()
                     state = BotState.COMBAT
                     logChat("${EnumChatFormatting.RED}Враг на острове! Прерываю лут, в бой!")
                     return
@@ -207,57 +211,65 @@ class SkywarsBot {
                 }
 
                 if (targetChest != null) {
-                    val isStuck = ChestLooter.tickApproach()
-                    if (isStuck) {
-                        logChat("${EnumChatFormatting.YELLOW}Сундук заблокирован, пропускаю...")
-                        return
-                    }
-
-                    val dist = player.getDistance(targetChest.x + 0.5, targetChest.y.toDouble(), targetChest.z + 0.5)
-                    ChestLooter.lookAtBlock(targetChest)
-
-                    if (dist > 2.8) {
-                        // Walk to chest
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
-
-                        // Auto-jump over 1-block obstacles/slabs on the island floor
-                        if (player.isCollidedHorizontally && player.onGround) {
-                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, true)
-                        } else {
-                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, false)
+                    // A* navigation: walks around obstacles and DOWN off a tree/elevation.
+                    when (SkyPathfinder.navigate(targetChest)) {
+                        SkyPathfinder.Status.REACHED -> {
+                            SkyPathfinder.stop()
+                            ChestLooter.lookAtBlock(targetChest)
+                            // Right-clicking a chest opens it even with a block in hand.
+                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, true)
+                            TimeHelper.setTimeout({
+                                KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false)
+                            }, 50)
                         }
-                    } else {
-                        // In reach: stop and right click to open
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, false)
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, false)
-                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, true)
-                        TimeHelper.setTimeout({
-                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false)
-                        }, 50)
+                        SkyPathfinder.Status.FAILED -> {
+                            // Unreachable chest: mark done and move on.
+                            ChestLooter.lootedChests.add(targetChest)
+                            ChestLooter.targetChestPos = null
+                            SkyPathfinder.reset()
+                            logChat("${EnumChatFormatting.YELLOW}Сундук недостижим, пропускаю...")
+                        }
+                        SkyPathfinder.Status.FOLLOWING -> { /* pathfinder drives movement */ }
                     }
                 } else {
                     // No reachable chest found right now.
+                    SkyPathfinder.stop()
                     stopAllMovement()
                     val elapsed = System.currentTimeMillis() - lootStartMs
                     // Leave looting once we've cleared every reachable chest, OR after
                     // the loot budget expires (covers islands with no/late-loading chests).
                     if (ChestLooter.lootedChests.isNotEmpty() || elapsed > lootBudgetMs) {
-                        state = BotState.COMBAT
-                        logChat("${EnumChatFormatting.GREEN}Лут завершен (${ChestLooter.lootedChests.size} сунд.). Держу остров, ищу врагов в радиусе ${ENGAGE_RANGE.toInt()}м.")
+                        midTarget = computeMid(player)
+                        pushStuckMs = System.currentTimeMillis()
+                        state = BotState.PUSHING
+                        logChat("${EnumChatFormatting.GREEN}Лут завершен (${ChestLooter.lootedChests.size} сунд.). Пушу на мид!")
                     }
                     // else: keep standing still while chunks/chests finish loading.
                 }
             }
 
-            BotState.BRIDGING -> {
-                // Offensive auto-bridging across the void is disabled: it caused the
-                // bot to chase players on other islands and walk into the void. Hold
-                // the island and fight anyone who comes within range instead.
-                SkyBridge.stopBridge()
-                targetBridgePos = null
-                state = BotState.COMBAT
+            BotState.PUSHING -> {
+                // Rush the middle of the map. If an enemy comes within range, fight.
+                if (CombatEngine.findNearestEnemy() != null) {
+                    SkyBridge.stopPush()
+                    state = BotState.COMBAT
+                    return
+                }
+                val mid = midTarget ?: computeMid(player).also { midTarget = it }
+                val distMid = player.getDistance(mid.x + 0.5, player.posY, mid.z + 0.5)
+
+                if (distMid < 3.0) {
+                    // Arrived at mid, nobody near: hold and let enemies come.
+                    SkyBridge.stopPush()
+                    stopAllMovement()
+                } else {
+                    val ok = SkyBridge.tickPush(mid)
+                    if (!ok) {
+                        // No blocks to scaffold across the void: hold the island.
+                        SkyBridge.stopPush()
+                        stopAllMovement()
+                    }
+                }
             }
 
             BotState.COMBAT -> {
@@ -267,12 +279,24 @@ class SkywarsBot {
                 if (nearestEnemy != null) {
                     CombatEngine.tickCombat()
                 } else {
-                    // Nobody in range: hold position, release keys, no aiming.
-                    stopAllMovement()
+                    // Nobody in range: resume pushing toward mid.
+                    CombatEngine.releaseCombatKeys()
                     CombatEngine.currentTarget = null
+                    state = BotState.PUSHING
                 }
             }
         }
+    }
+
+    /** Estimate the map centre as the centroid of all loaded players. */
+    private fun computeMid(player: net.minecraft.entity.player.EntityPlayer): BlockPos {
+        val world = mc.theWorld
+        var sx = 0.0; var sz = 0.0; var n = 0
+        if (world != null) {
+            for (p in world.playerEntities) { sx += p.posX; sz += p.posZ; n++ }
+        }
+        return if (n > 0) BlockPos(sx / n, player.posY, sz / n)
+        else BlockPos(0.0, player.posY, 0.0)
     }
 
     private fun stopAllMovement() {
