@@ -248,20 +248,16 @@ class SkywarsBot {
                     state = BotState.COMBAT
                     return
                 }
-                val mid = midTarget ?: computeMid(player).also { midTarget = it }
-                val distMid = player.getDistance(mid.x + 0.5, player.posY, mid.z + 0.5)
-
-                if (distMid < 3.0) {
-                    // Arrived at mid, nobody near: hold and let enemies come.
+                // Bridge toward the nearest other player — they stand on real islands
+                // (a mini island or centre), which is where we want to go. Only fall
+                // back to the map centroid if nobody is loaded.
+                val target = nearestPlayerPos(player)
+                    ?: midTarget ?: computeMid(player).also { midTarget = it }
+                val ok = SkyBridge.tickPush(target)
+                if (!ok) {
+                    // No blocks to scaffold across the void: hold the island.
                     SkyBridge.stopPush()
                     stopAllMovement()
-                } else {
-                    val ok = SkyBridge.tickPush(mid)
-                    if (!ok) {
-                        // No blocks to scaffold across the void: hold the island.
-                        SkyBridge.stopPush()
-                        stopAllMovement()
-                    }
                 }
             }
 
@@ -291,6 +287,21 @@ class SkywarsBot {
             }
             e.printStackTrace()
         }
+    }
+
+    /** Nearest living other player's position (their island), or null if none loaded. */
+    private fun nearestPlayerPos(player: net.minecraft.entity.player.EntityPlayer): BlockPos? {
+        val world = mc.theWorld ?: return null
+        var best: net.minecraft.entity.player.EntityPlayer? = null
+        var bestD = Double.MAX_VALUE
+        for (p in world.playerEntities) {
+            if (p === player || p !is net.minecraft.entity.player.EntityPlayer) continue
+            if (p.isDead || p.health <= 0f) continue
+            val d = player.getDistanceSqToEntity(p)
+            if (d < bestD) { bestD = d; best = p }
+        }
+        val b = best ?: return null
+        return BlockPos(b.posX, b.posY, b.posZ)
     }
 
     /** Estimate the map centre as the centroid of all loaded players. */

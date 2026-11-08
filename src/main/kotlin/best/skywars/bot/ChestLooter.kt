@@ -41,8 +41,10 @@ object ChestLooter {
             if (tile is TileEntityChest) {
                 val pos = tile.pos
                 if (lootedChests.contains(pos)) continue
-                // Ignore chests far below us (another island under the map).
-                if (Math.abs(pos.y - player.posY) > 10.0) continue
+                // Surface chests only: skip chests below us (cave/under-island) and
+                // anything high above. We're standing on the island when this runs.
+                val dy = pos.y - player.posY
+                if (dy < -1.5 || dy > 4.0) continue
                 val d2 = player.getDistanceSq(pos)
                 if (d2 < bestD2) { bestD2 = d2; best = pos }
             }
