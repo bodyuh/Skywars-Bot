@@ -119,7 +119,7 @@ class SkywarsBot {
             state = BotState.LOOTING_CHESTS
             landingPos = null
             midTarget = null
-            lootStartMs = 0L
+            lootStartMs = System.currentTimeMillis()
             loggedErr = false
             ChestLooter.reset()
             CombatEngine.reset()
@@ -174,80 +174,70 @@ class SkywarsBot {
             }
 
             BotState.LOOTING_CHESTS -> {
-                // Wait until player lands on solid ground after dropping from cage
-                if (landingPos == null) {
-                    if (player.onGround) {
-                        landingPos = BlockPos(player.posX, player.posY, player.posZ)
-                        lootStartMs = System.currentTimeMillis()
-                        logChat("${EnumChatFormatting.GREEN}Приземлился на остров (Y=${landingPos!!.y}). Ищу сундуки...")
-                    } else {
-                        // Still in air, do not walk or look around
-                        stopAllMovement()
-                        return
-                    }
+                // Don't walk/look while still falling from the cage.
+                if (!player.onGround) {
+                    stopAllMovement()
+                    return
                 }
 
-                val origin = landingPos ?: BlockPos(player.posX, player.posY, player.posZ)
-
-                // Defensive break-off: if an enemy is right on top of us while looting,
-                // stop looting and fight. Kept tight (melee range) so enemies merely
-                // standing on their own island don't interrupt the loot run.
+                // Defensive break-off: enemy right on top of us -> fight.
                 if (mc.currentScreen == null && CombatEngine.findNearestEnemy(5.0) != null) {
                     ChestLooter.targetChestPos = null
-                    SkyPathfinder.stop()
+                    stopAllMovement()
                     state = BotState.COMBAT
                     logChat("${EnumChatFormatting.RED}Враг на острове! Прерываю лут, в бой!")
                     return
                 }
 
-                // Currently in a chest GUI -> grab valuables
+                // In a chest GUI -> grab valuables.
                 if (mc.currentScreen != null) {
                     ChestLooter.tickLooting()
                     return
                 }
 
-                // Find next chest to loot
+                // Nearest un-looted chest to the player.
                 var targetChest = ChestLooter.targetChestPos
                 if (targetChest == null) {
-                    targetChest = ChestLooter.findNextChest(origin)
+                    targetChest = ChestLooter.findNextChest(BlockPos(player.posX, player.posY, player.posZ))
                     ChestLooter.targetChestPos = targetChest
                 }
 
                 if (targetChest != null) {
-                    // A* navigation: walks around obstacles and DOWN off a tree/elevation.
-                    when (SkyPathfinder.navigate(targetChest)) {
-                        SkyPathfinder.Status.REACHED -> {
-                            SkyPathfinder.stop()
-                            ChestLooter.lookAtBlock(targetChest)
-                            // Right-clicking a chest opens it even with a block in hand.
-                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, true)
-                            TimeHelper.setTimeout({
-                                KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false)
-                            }, 50)
+                    if (ChestLooter.tickApproach()) {
+                        logChat("${EnumChatFormatting.YELLOW}Сундук заблокирован, пропускаю...")
+                        return
+                    }
+                    // Turn toward the chest and walk straight to it.
+                    ChestLooter.lookAtBlock(targetChest)
+                    val dist = player.getDistance(targetChest.x + 0.5, player.posY, targetChest.z + 0.5)
+                    if (dist > 2.6) {
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
+                        if (player.isCollidedHorizontally && player.onGround) {
+                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, true)
+                        } else {
+                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, false)
                         }
-                        SkyPathfinder.Status.FAILED -> {
-                            // Unreachable chest: mark done and move on.
-                            ChestLooter.lootedChests.add(targetChest)
-                            ChestLooter.targetChestPos = null
-                            SkyPathfinder.reset()
-                            logChat("${EnumChatFormatting.YELLOW}Сундук недостижим, пропускаю...")
-                        }
-                        SkyPathfinder.Status.FOLLOWING -> { /* pathfinder drives movement */ }
+                    } else {
+                        // In reach: stop and right-click to open.
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, false)
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.keyCode, false)
+                        KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, true)
+                        TimeHelper.setTimeout({
+                            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.keyCode, false)
+                        }, 60)
                     }
                 } else {
-                    // No reachable chest found right now.
-                    SkyPathfinder.stop()
+                    // No chest in range right now.
                     stopAllMovement()
                     val elapsed = System.currentTimeMillis() - lootStartMs
-                    // Leave looting once we've cleared every reachable chest, OR after
-                    // the loot budget expires (covers islands with no/late-loading chests).
                     if (ChestLooter.lootedChests.isNotEmpty() || elapsed > lootBudgetMs) {
                         midTarget = computeMid(player)
-                        pushStuckMs = System.currentTimeMillis()
                         state = BotState.PUSHING
                         logChat("${EnumChatFormatting.GREEN}Лут завершен (${ChestLooter.lootedChests.size} сунд.). Пушу на мид!")
                     }
-                    // else: keep standing still while chunks/chests finish loading.
+                    // else: wait a moment for chests/chunks to finish loading.
                 }
             }
 
