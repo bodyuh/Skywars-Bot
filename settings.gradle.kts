@@ -1,4 +1,4 @@
-rootProject.name = "BedwarsAFK-Kotlin"
+rootProject.name = "SkywarsBot"
 
 pluginManagement {
     repositories {
