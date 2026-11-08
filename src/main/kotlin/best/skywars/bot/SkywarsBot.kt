@@ -51,6 +51,7 @@ class SkywarsBot {
     private var midTarget: BlockPos? = null
     private var lootStartMs = 0L
     private var pushStuckMs = 0L
+    private var loggedErr = false
 
     // How long to stay in the looting phase. Replays of won games show the human
     // loots for ~11-15s (opening many chests) BEFORE the first fight, so give the
@@ -119,6 +120,7 @@ class SkywarsBot {
             landingPos = null
             midTarget = null
             lootStartMs = 0L
+            loggedErr = false
             ChestLooter.reset()
             CombatEngine.reset()
             SkyPathfinder.reset()
@@ -160,6 +162,7 @@ class SkywarsBot {
 
         if (!isEnabled) return
 
+        try {
         when (state) {
             BotState.LOBBY -> {
                 // Idle in lobby or waiting
@@ -285,6 +288,18 @@ class SkywarsBot {
                     state = BotState.PUSHING
                 }
             }
+        }
+        } catch (e: Throwable) {
+            // Never leave keys locked if something throws mid-tick.
+            stopAllMovement()
+            CombatEngine.releaseCombatKeys()
+            SkyBridge.stopPush()
+            SkyPathfinder.stop()
+            if (!loggedErr) {
+                logChat("${EnumChatFormatting.RED}Ошибка в тике (клавиши отпущены): ${e.message}")
+                loggedErr = true
+            }
+            e.printStackTrace()
         }
     }
 

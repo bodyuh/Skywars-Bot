@@ -1,15 +1,15 @@
 package best.skywars.bot
 
 import net.minecraft.client.Minecraft
+import net.minecraft.client.settings.GameSettings
 import net.minecraft.client.settings.KeyBinding
 import net.minecraft.entity.Entity
 import net.minecraft.entity.player.EntityPlayer
 import net.minecraft.init.Blocks
-import net.minecraft.item.ItemAppleGold
-import net.minecraft.item.ItemFishingRod
 import net.minecraft.item.ItemSword
 import net.minecraft.util.BlockPos
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.sqrt
 
@@ -18,50 +18,42 @@ import kotlin.math.sqrt
 const val ENGAGE_RANGE: Double = 10.0
 
 /**
- * Melee engine rewritten after duck-dueller-v2 technique and analysis of the
- * player's (imnumbagain) won replays:
- *  - NO fishing rod: the human used the rod 0% of the time across 3 wins.
- *  - Heavy A/D strafing (~20-35% each) with mostly-forward pressure.
- *  - Smooth, capped, distance-scaled aim (not instant GCD snapping).
- *  - Click autoclicker 9-13 CPS, firing only on a real raycast hit.
- *  - Combo-based crit jumps.
+ * Combat "brain". The player runs Vape with a full combat suite (AimAssist,
+ * AutoClicker, HitSelect, BlockHit, JumpReset, KnockbackDelay, reach, keepsprint,
+ * Scaffold, FastPlace). So this engine does NOT do its own fine aiming, clicking,
+ * crit-jumping or item use — that fought Vape and froze the bot. It only:
+ *   - picks the target and the best sword,
+ *   - coarse-faces the enemy so Vape AimAssist can take over,
+ *   - holds attack so Vape AutoClicker/HitSelect/reach land the hits,
+ *   - strafes and spaces,
+ *   - bridges toward an enemy across a gap by holding right-click (Vape Scaffold),
+ *   - backs off when the enemy has Bulldozer strength.
+ * Every key it may hold is released by [releaseCombatKeys]; the tick handler is
+ * wrapped in try/catch so a thrown exception can never leave keys locked.
  */
 object CombatEngine {
 
     private val mc = Minecraft.getMinecraft()
 
-    // Tracks players with active Strength perk: PlayerName -> Expiry timestamp (ms)
     val strengthMap = ConcurrentHashMap<String, Long>()
 
     var currentTarget: EntityPlayer? = null
     var isAvoidingStrength = false
 
-    // ---- combat state ----
-    private var combo = 0
-    private var lastHitMs = 0L
-    private var lastClickMs = 0L
-    private var nextCps = 95L
-
-    private var strafeDir = 1              // +1 = right (D), -1 = left (A)
+    private var strafeDir = 1
     private var nextStrafeSwitchMs = 0L
-
-    private var forwardBlockedUntilMs = 0L // W-tap window
-    private var jumpReleaseAtMs = 0L
-
-    private var eatingUntilMs = 0L
-    private var lastEatMs = 0L
-    private var savedSlotBeforeEat = -1
+    private var attackDown = false
+    private var rmbDown = false
+    private var lastJumpMs = 0L
 
     fun reset() {
         strengthMap.clear()
         currentTarget = null
         isAvoidingStrength = false
-        combo = 0
-        eatingUntilMs = 0L
         releaseCombatKeys()
     }
 
-    /** Release every movement/attack key this engine may hold. */
+    /** Release every key this engine can hold. Called on reset / leaving combat. */
     fun releaseCombatKeys() {
         val gs = mc.gameSettings ?: return
         KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
@@ -72,11 +64,13 @@ object CombatEngine {
         KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, false)
+        attackDown = false
+        rmbDown = false
     }
 
     // ---- Strength (Bulldozer) tracking ----
     fun onPlayerKill(killerName: String) {
-        val cleanName = killerName.trim().split(" ").last() // strips rank like [VIP+]
+        val cleanName = killerName.trim().split(" ").last()
         strengthMap[cleanName] = System.currentTimeMillis() + 5000L
     }
 
@@ -91,37 +85,23 @@ object CombatEngine {
         return if (rem > 0) rem / 1000f else 0f
     }
 
-    /**
-     * Find nearest alive enemy player WITHIN engage range (default 10 blocks).
-     * Anything beyond this is treated as "on another island" and ignored, so the
-     * bot never snap-aims across the void at players it cannot reach.
-     */
     fun findNearestEnemy(maxDistance: Double = ENGAGE_RANGE): EntityPlayer? {
         val player = mc.thePlayer ?: return null
         val world = mc.theWorld ?: return null
-
         var nearest: EntityPlayer? = null
         var bestDist = maxDistance
-
         for (other in world.playerEntities) {
             if (other == player || other !is EntityPlayer) continue
             if (other.isDead || other.health <= 0f) continue
             if (other.isInvisibleToPlayer(player)) continue
-            if (Math.abs(other.posY - player.posY) > 6.0) continue
-
+            if (abs(other.posY - player.posY) > 6.0) continue
             val dist = player.getDistanceToEntity(other).toDouble()
-            if (dist < bestDist) {
-                bestDist = dist
-                nearest = other
-            }
+            if (dist < bestDist) { bestDist = dist; nearest = other }
         }
         return nearest
     }
 
-    /**
-     * Main melee tick. Handles aim, autoclick, strafe, w-tap, crit jumps,
-     * gapple heal and anti-strength backpedal. No fishing rod.
-     */
+    /** Main melee tick. Delegates the actual PvP mechanics to Vape. */
     fun tickCombat() {
         val player = mc.thePlayer ?: return
         val gs = mc.gameSettings ?: return
@@ -131,157 +111,90 @@ object CombatEngine {
         val target = currentTarget
         if (target == null) {
             isAvoidingStrength = false
-            combo = 0
             releaseCombatKeys()
             return
         }
 
         val dist = player.getDistanceToEntity(target)
+        val voidToTarget = isVoidTowards(target.posX - player.posX, target.posZ - player.posZ)
 
-        // Decay combo if we've not landed a hit recently or drifted far.
-        if (now - lastHitMs > 900 || dist > 5f) combo = 0
+        // Coarse facing only — Vape AimAssist does the precise tracking.
+        coarseFace(target)
+        KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, true)
 
-        // Always track the target smoothly.
-        aimAt(target)
-
-        // Equip best sword (unless mid-eat).
-        if (now >= eatingUntilMs) {
-            val swordSlot = findBestSwordSlot()
-            if (swordSlot != -1 && player.inventory.currentItem != swordSlot) {
-                player.inventory.currentItem = swordSlot
-            }
-        }
-
-        // --- Gapple heal: low HP, have a gapple, not already eating, cooldown ok ---
-        if (now >= eatingUntilMs && player.health <= 6f && now - lastEatMs > 6000) {
-            val gapSlot = findHotbarGapple()
-            if (gapSlot != -1) {
-                savedSlotBeforeEat = player.inventory.currentItem
-                player.inventory.currentItem = gapSlot
-                KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, true)
-                eatingUntilMs = now + 1800
-                lastEatMs = now
-            }
-        }
-        if (now < eatingUntilMs) {
-            // While eating: stand still-ish, keep use held, no attacking.
-            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, true)
-            KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
-            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
-            return
-        } else if (savedSlotBeforeEat != -1) {
-            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, false)
-            val swordSlot = findBestSwordSlot()
-            player.inventory.currentItem = if (swordSlot != -1) swordSlot else savedSlotBeforeEat
-            savedSlotBeforeEat = -1
-        }
-
-        // --- Anti-Strength: enemy under Bulldozer strength -> keep distance, no pushing ---
-        if (hasStrength(target)) {
+        // --- Anti-strength: enemy under Bulldozer -> back off, don't trade ---
+        if (hasStrength(target) && dist < 7f) {
             isAvoidingStrength = true
-            KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, true)
-            if (dist < 7f) {
-                // back off, but not off the island
-                if (!isVoidTowards(player.posX - target.posX, player.posZ - target.posZ)) {
-                    KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
-                    KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, true)
-                } else {
-                    KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
-                }
-                doStrafe(player, target, now)
+            setAttack(gs, false)
+            setRmb(gs, false)
+            selectSword(player)
+            val backVoid = isVoidTowards(player.posX - target.posX, player.posZ - target.posZ)
+            if (!backVoid) {
+                KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+                KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, true)
             } else {
                 KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
-                clearStrafe(gs)
             }
-            // still trade hits if they walk into reach
-            tryAttack(player, gs, target, dist, now)
+            doStrafe(player, target, now)
             return
         }
         isAvoidingStrength = false
+        KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
 
-        // --- Normal melee ---
-        KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, true)
+        // --- Enemy across a gap: bridge toward them with Vape Scaffold ---
+        if (dist > 3.3f && voidToTarget) {
+            val blocks = SkyBridge.findHotbarBlocks()
+            if (blocks != -1) {
+                if (player.inventory.currentItem != blocks) player.inventory.currentItem = blocks
+                setAttack(gs, false)
+                clearStrafe(gs)
+                if (player.rotationPitch < 30f) player.rotationPitch = 44f // help Scaffold find the edge
+                KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, true)
+                setRmb(gs, true)
+                predictiveJump(player, gs, now)
+            } else {
+                // No blocks to cross: hold ground, keep facing, no falling.
+                KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+                clearStrafe(gs)
+                setRmb(gs, false)
+                setAttack(gs, false)
+            }
+            return
+        }
 
-        // Forward / W-tap spacing (mirrors duck-dueller Combo).
-        val wantForward = !(dist < 1.5f || (dist < 2.4f && combo >= 1))
-        if (now < forwardBlockedUntilMs) {
-            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
-            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
-        } else if (wantForward && !isVoidTowards(target.posX - player.posX, target.posZ - player.posZ)) {
+        // --- Melee on reachable ground: let Vape do the hitting ---
+        setRmb(gs, false)
+        selectSword(player)
+        setAttack(gs, true) // Vape AutoClicker/HitSelect/reach convert the held LMB into hits
+
+        if (dist > 2.3f && !voidToTarget) {
             KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, true)
-            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
         } else {
             KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
-            KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
         }
 
-        // Strafe when in a fighting pocket.
         if (dist < 7f) doStrafe(player, target, now) else clearStrafe(gs)
 
-        // Crit jumps on a built combo.
-        if (combo >= 3 && dist >= 3.2f && player.onGround && now > jumpReleaseAtMs + 200) {
-            KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, true)
-            jumpReleaseAtMs = now + 120
-        }
-        if (now >= jumpReleaseAtMs) {
-            KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
-        }
-
-        tryAttack(player, gs, target, dist, now)
+        // only jump to climb a block we're stuck on (combat crits are Vape JumpReset)
+        if (player.isCollidedHorizontally) predictiveJump(player, gs, now)
     }
 
-    private fun tryAttack(player: EntityPlayer, gs: net.minecraft.client.settings.GameSettings,
-                          target: EntityPlayer, dist: Float, now: Long) {
-        val over = mc.objectMouseOver
-        val aimedAtTarget = over != null && over.entityHit === target
-        if ((aimedAtTarget || dist <= 3.0f) && now - lastClickMs >= nextCps) {
-            // native swing + direct attack so Vape handles reach/raycast legitimately
-            if (!player.isUsingItem) {
-                player.swingItem()
-                if (aimedAtTarget) {
-                    mc.playerController.attackEntity(player, target)
-                }
-                KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, true)
-                TimeHelper.setTimeout({
-                    KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, false)
-                }, (25 + Math.random() * 20).toLong())
-
-                lastClickMs = now
-                nextCps = (1000L / (9 + (Math.random() * 5).toInt()))  // ~9-13 CPS
-                if (aimedAtTarget) {
-                    combo++
-                    lastHitMs = now
-                    // W-tap: drop forward momentum briefly for extra knockback
-                    forwardBlockedUntilMs = now + (60 + Math.random() * 50).toLong()
-                }
-            }
-        }
-    }
-
+    // ---- helpers ----
     private fun doStrafe(player: EntityPlayer, target: EntityPlayer, now: Long) {
         val gs = mc.gameSettings ?: return
         if (now > nextStrafeSwitchMs) {
-            // When closing a combo, bias strafe toward the enemy's back.
-            if (combo > 2) {
-                val dyaw = wrap180(angleToYaw(target.posX - player.posX, target.posZ - player.posZ) - player.rotationYaw)
-                strafeDir = if (dyaw < 0) -1 else 1
-            } else {
-                strafeDir = -strafeDir
-            }
+            strafeDir = -strafeDir
             nextStrafeSwitchMs = now + (280 + Math.random() * 420).toLong()
         }
-        // perpendicular-to-target direction for the current strafe side
         val tx = target.posX - player.posX
         val tz = target.posZ - player.posZ
-        // right vector relative to facing the target: (dz, -dx) ; left is negation
-        val px = if (strafeDir > 0) tz else -tz
-        val pz = if (strafeDir > 0) -tx else tx
+        var px = if (strafeDir > 0) tz else -tz
+        var pz = if (strafeDir > 0) -tx else tx
         if (isVoidTowards(px, pz)) {
-            // edge on that side: flip once; if both bad, don't strafe
             strafeDir = -strafeDir
-            val px2 = if (strafeDir > 0) tz else -tz
-            val pz2 = if (strafeDir > 0) -tx else tx
-            if (isVoidTowards(px2, pz2)) { clearStrafe(gs); return }
+            px = if (strafeDir > 0) tz else -tz
+            pz = if (strafeDir > 0) -tx else tx
+            if (isVoidTowards(px, pz)) { clearStrafe(gs); return }
         }
         if (strafeDir > 0) {
             KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, true)
@@ -292,47 +205,63 @@ object CombatEngine {
         }
     }
 
-    private fun clearStrafe(gs: net.minecraft.client.settings.GameSettings) {
+    private fun clearStrafe(gs: GameSettings) {
         KeyBinding.setKeyBindState(gs.keyBindLeft.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindRight.keyCode, false)
     }
 
-    // ---- aim ----
-    fun lookAtEntity(target: Entity) = aimAt(target)
+    private fun predictiveJump(player: EntityPlayer, gs: GameSettings, now: Long) {
+        if (player.onGround && now - lastJumpMs > 350) {
+            KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, true)
+            lastJumpMs = now
+            TimeHelper.setTimeout({ KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false) }, 110)
+        }
+    }
 
-    private fun aimAt(target: Entity) {
+    private fun setAttack(gs: GameSettings, down: Boolean) {
+        if (down != attackDown) {
+            attackDown = down
+            KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, down)
+        }
+    }
+
+    private fun setRmb(gs: GameSettings, down: Boolean) {
+        if (down != rmbDown) {
+            rmbDown = down
+            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, down)
+        }
+    }
+
+    private fun selectSword(player: EntityPlayer) {
+        val s = findBestSwordSlot()
+        if (s != -1 && player.inventory.currentItem != s) player.inventory.currentItem = s
+    }
+
+    /** Coarse aim: only correct when badly off so we don't fight Vape AimAssist. */
+    fun lookAtEntity(target: Entity) = coarseFace(target)
+
+    private fun coarseFace(target: Entity) {
         val player = mc.thePlayer ?: return
         val dx = target.posX - player.posX
         val dz = target.posZ - player.posZ
         val dy = (target.posY + target.getEyeHeight() * 0.9) - (player.posY + player.getEyeHeight())
         val distXZ = sqrt(dx * dx + dz * dz)
-
         val targetYaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
         val targetPitch = (-Math.toDegrees(atan2(dy, distXZ))).toFloat().coerceIn(-90f, 90f)
 
-        val dist3 = player.getDistanceToEntity(target)
-        val factor = when {
-            dist3 <= 10f -> 1.0f
-            dist3 <= 20f -> 0.6f
-            else -> 0.4f
+        var dyaw = wrap180(targetYaw - player.rotationYaw)
+        if (abs(dyaw) > 30f) {
+            if (dyaw > 12f) dyaw = 12f
+            if (dyaw < -12f) dyaw = -12f
+            player.rotationYaw += dyaw
         }
-        val maxYaw = 9f * factor
-        val maxPitch = 5f * factor
-
-        var dyaw = wrap180(targetYaw - player.rotationYaw) + (Math.random() * 2 - 1).toFloat()
-        var dpitch = (targetPitch - player.rotationPitch) + (Math.random() * 1.2 - 0.6).toFloat()
-
-        if (dyaw > maxYaw) dyaw = maxYaw
-        if (dyaw < -maxYaw) dyaw = -maxYaw
-        if (dpitch > maxPitch) dpitch = maxPitch
-        if (dpitch < -maxPitch) dpitch = -maxPitch
-
-        player.rotationYaw += dyaw
-        player.rotationPitch = (player.rotationPitch + dpitch).coerceIn(-90f, 90f)
+        var dpitch = targetPitch - player.rotationPitch
+        if (abs(dpitch) > 25f) {
+            if (dpitch > 8f) dpitch = 8f
+            if (dpitch < -8f) dpitch = -8f
+            player.rotationPitch = (player.rotationPitch + dpitch).coerceIn(-90f, 90f)
+        }
     }
-
-    private fun angleToYaw(dx: Double, dz: Double): Float =
-        (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
 
     private fun wrap180(ang: Float): Float {
         var a = ang % 360f
@@ -360,26 +289,6 @@ object CombatEngine {
         return true
     }
 
-    // ---- inventory helpers ----
-    private fun findHotbarGapple(): Int {
-        val player = mc.thePlayer ?: return -1
-        for (i in 0..8) {
-            val s = player.inventory.getStackInSlot(i)
-            if (s != null && s.item is ItemAppleGold) return i
-        }
-        return -1
-    }
-
-    @Suppress("unused")
-    private fun findHotbarRod(): Int {
-        val player = mc.thePlayer ?: return -1
-        for (i in 0..8) {
-            val s = player.inventory.getStackInSlot(i)
-            if (s != null && s.item is ItemFishingRod) return i
-        }
-        return -1
-    }
-
     private fun findBestSwordSlot(): Int {
         val player = mc.thePlayer ?: return -1
         var bestSlot = -1
@@ -388,10 +297,7 @@ object CombatEngine {
             val stack = player.inventory.getStackInSlot(i)
             if (stack != null && stack.item is ItemSword) {
                 val score = ItemFilter.getSwordScore(stack)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestSlot = i
-                }
+                if (score > bestScore) { bestScore = score; bestSlot = i }
             }
         }
         return bestSlot
