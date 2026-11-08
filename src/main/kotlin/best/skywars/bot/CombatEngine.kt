@@ -4,11 +4,17 @@ import net.minecraft.client.Minecraft
 import net.minecraft.client.settings.KeyBinding
 import net.minecraft.entity.Entity
 import net.minecraft.entity.player.EntityPlayer
+import net.minecraft.init.Blocks
 import net.minecraft.item.ItemFishingRod
 import net.minecraft.item.ItemSword
+import net.minecraft.util.BlockPos
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.atan2
 import kotlin.math.sqrt
+
+// SkyWars engage range. Enemies farther than this (e.g. on other islands across
+// the void) are IGNORED: the bot never aims at or chases them.
+const val ENGAGE_RANGE: Double = 10.0
 
 object CombatEngine {
 
@@ -30,6 +36,17 @@ object CombatEngine {
         currentTarget = null
         isAvoidingStrength = false
         rodStage = 0
+        releaseCombatKeys()
+    }
+
+    /** Release every movement/attack key this engine may hold. */
+    fun releaseCombatKeys() {
+        val gs = mc.gameSettings ?: return
+        KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindAttack.keyCode, false)
     }
 
     /**
@@ -52,9 +69,11 @@ object CombatEngine {
     }
 
     /**
-     * Find nearest alive enemy player
+     * Find nearest alive enemy player WITHIN engage range (default 10 blocks).
+     * Anything beyond this is treated as "on another island" and ignored, so the
+     * bot never snap-aims across the void at players it cannot reach.
      */
-    fun findNearestEnemy(maxDistance: Double = 40.0): EntityPlayer? {
+    fun findNearestEnemy(maxDistance: Double = ENGAGE_RANGE): EntityPlayer? {
         val player = mc.thePlayer ?: return null
         val world = mc.theWorld ?: return null
 
@@ -65,6 +84,8 @@ object CombatEngine {
             if (other == player || other !is EntityPlayer) continue
             if (other.isDead || other.health <= 0f) continue
             if (other.isInvisibleToPlayer(player)) continue
+            // Spectators / lobby ghosts fly; a real combatant is near our height.
+            if (Math.abs(other.posY - player.posY) > 6.0) continue
 
             val dist = player.getDistanceToEntity(other).toDouble()
             if (dist < bestDist) {
@@ -75,6 +96,31 @@ object CombatEngine {
         return nearest
     }
 
+    /**
+     * True if walking straight toward [target] would step off the island into the
+     * void (no solid block ~1 block ahead at feet level or just below it).
+     */
+    private fun isVoidAhead(target: Entity): Boolean {
+        val player = mc.thePlayer ?: return false
+        val world = mc.theWorld ?: return false
+        val dx = target.posX - player.posX
+        val dz = target.posZ - player.posZ
+        val len = sqrt(dx * dx + dz * dz)
+        if (len < 0.01) return false
+        val nx = dx / len
+        val nz = dz / len
+        val checkX = player.posX + nx * 1.1
+        val checkZ = player.posZ + nz * 1.1
+        val feet = BlockPos(checkX, player.posY - 0.2, checkZ)
+        // Solid ground must exist within 1 block below the step-ahead position.
+        for (dy in 0..1) {
+            val p = BlockPos(feet.x, feet.y - dy, feet.z)
+            val b = world.getBlockState(p).block
+            if (b != Blocks.air && b.isCollidable) return false
+        }
+        return true
+    }
+
     fun tickCombat() {
         val player = mc.thePlayer ?: return
         val world = mc.theWorld ?: return
@@ -83,7 +129,10 @@ object CombatEngine {
         val target = currentTarget
 
         if (target == null) {
+            // No enemy within engage range: release all combat movement so we
+            // don't keep walking/sprinting toward nothing (and into the void).
             isAvoidingStrength = false
+            releaseCombatKeys()
             return
         }
 
@@ -139,9 +188,16 @@ object CombatEngine {
 
         // Approach & W-Tap combo movement
         if (dist > 2.2f) {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
+            if (isVoidAhead(target)) {
+                // Enemy is across an edge/gap: hold the island, never chase off.
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, false)
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
+            } else {
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, true)
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.keyCode, false)
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.keyCode, true)
+            }
         } else if (dist < 1.7f) {
             // Keep sweet spot combo distance ~1.9m - 2.1m
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.keyCode, false)
