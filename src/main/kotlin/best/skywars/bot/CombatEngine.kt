@@ -98,7 +98,12 @@ object CombatEngine {
             if (other.isInvisibleToPlayer(player)) continue
             if (abs(other.posY - player.posY) > 6.0) continue
             val dist = player.getDistanceToEntity(other).toDouble()
-            if (dist < bestDist) { bestDist = dist; nearest = other }
+            if (dist >= bestDist) continue
+            // Line of sight: don't aim/engage through walls or across the void at
+            // someone behind cover. Within melee range (<=4) we fight regardless.
+            if (dist > 4.0 && !player.canEntityBeSeen(other)) continue
+            bestDist = dist
+            nearest = other
         }
         return nearest
     }

@@ -39,15 +39,21 @@ object SkyBridge {
         val dx = (target.x + 0.5) - player.posX
         val dz = (target.z + 0.5) - player.posZ
         player.rotationYaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
-        player.rotationPitch = 78f
+        player.rotationPitch = 76f
 
-        // Walk forward and hold right-click the WHOLE time (Scaffold).
+        // LEGIT Scaffold places at human speed, so we must NOT outrun it off the
+        // edge. SNEAK the whole time: sneaking stops us walking off a ledge until
+        // the block is actually placed. Then forward + hold right-click.
+        KeyBinding.setKeyBindState(gs.keyBindSneak.keyCode, true)
+        KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, true)
         holdRmb(gs)
 
-        // Block-jump onto an island edge that's 1-2 blocks up/ahead.
+        // Block-jump onto an island edge that's 1-2 blocks up/ahead (release sneak
+        // briefly for the hop so we can actually climb).
         val now = System.currentTimeMillis()
         if (player.isCollidedHorizontally && player.onGround && now - lastJumpMs > 300) {
+            KeyBinding.setKeyBindState(gs.keyBindSneak.keyCode, false)
             KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, true)
             lastJumpMs = now
             TimeHelper.setTimeout({ KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false) }, 120)
@@ -61,6 +67,7 @@ object SkyBridge {
         KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindSprint.keyCode, false)
         KeyBinding.setKeyBindState(gs.keyBindJump.keyCode, false)
+        KeyBinding.setKeyBindState(gs.keyBindSneak.keyCode, false)
         releaseRmb(gs)
     }
 
