@@ -6,6 +6,7 @@ import net.minecraft.client.settings.KeyBinding
 import net.minecraft.entity.Entity
 import net.minecraft.entity.player.EntityPlayer
 import net.minecraft.init.Blocks
+import net.minecraft.item.ItemFishingRod
 import net.minecraft.item.ItemSword
 import net.minecraft.util.BlockPos
 import java.util.concurrent.ConcurrentHashMap
@@ -45,6 +46,7 @@ object CombatEngine {
     private var attackDown = false
     private var rmbDown = false
     private var lastJumpMs = 0L
+    private var lastRodMs = 0L
 
     fun reset() {
         strengthMap.clear()
@@ -140,6 +142,27 @@ object CombatEngine {
         }
         isAvoidingStrength = false
         KeyBinding.setKeyBindState(gs.keyBindBack.keyCode, false)
+
+        // --- Fishing rod: enemy in the (3, 5] band (too far to melee) and a rod
+        // sits in the SECOND hotbar slot -> cast it for knockback, then back to sword. ---
+        val rodSlot = rodInSecondSlot()
+        if (rodSlot != -1 && dist > 3.0f && dist <= 5.0f && now - lastRodMs > 1600) {
+            setAttack(gs, false)
+            clearStrafe(gs)
+            KeyBinding.setKeyBindState(gs.keyBindForward.keyCode, false)
+            preciseAim(target)
+            if (player.inventory.currentItem != rodSlot) player.inventory.currentItem = rodSlot
+            // pulse right-click to cast
+            KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, true)
+            rmbDown = true
+            lastRodMs = now
+            TimeHelper.setTimeout({
+                KeyBinding.setKeyBindState(gs.keyBindUseItem.keyCode, false)
+                rmbDown = false
+                selectSword(player)
+            }, 140)
+            return
+        }
 
         // --- Enemy across a gap: bridge toward them with Vape Scaffold ---
         if (dist > 3.3f && voidToTarget) {
@@ -287,6 +310,24 @@ object CombatEngine {
             if (b != Blocks.air && b.isCollidable) return false
         }
         return true
+    }
+
+    /** Fishing rod in the second hotbar slot (index 1), else -1. */
+    private fun rodInSecondSlot(): Int {
+        val player = mc.thePlayer ?: return -1
+        val s = player.inventory.getStackInSlot(1)
+        return if (s != null && s.item is ItemFishingRod) 1 else -1
+    }
+
+    /** Snap aim straight at the target (used only for the one-tick rod cast). */
+    private fun preciseAim(target: Entity) {
+        val player = mc.thePlayer ?: return
+        val dx = target.posX - player.posX
+        val dz = target.posZ - player.posZ
+        val dy = (target.posY + target.getEyeHeight() * 0.9) - (player.posY + player.getEyeHeight())
+        val distXZ = sqrt(dx * dx + dz * dz)
+        player.rotationYaw = (Math.toDegrees(atan2(dz, dx)) - 90.0).toFloat()
+        player.rotationPitch = (-Math.toDegrees(atan2(dy, distXZ))).toFloat().coerceIn(-90f, 90f)
     }
 
     private fun findBestSwordSlot(): Int {
